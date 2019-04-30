@@ -3,7 +3,6 @@
 #include <cuda_runtime.h>
 
 __global__ void relu_forward(float *x, int N);
-
 __global__ void backward_w(float *input_grad, float *cache, float *output_grad, int N);
 __global__ void backward_x(float *input_grad, float *cache, float *output_grad, int N);
 __global__ void relu_backward(float *input_grad, float *cache, float *output_grad, int N);
@@ -11,9 +10,15 @@ __global__ void subtract(float *a, float *b, int N);
 __global__ void add(float *a, float *b, int N);
 __global__ void softmax_backward(float*,float*,int);
 __global__ void softmax(float*,int, int);
+
 class Layer
 {
   public:
+
+    int my_node;
+    int is_next_on_my_node; // -1 -> doesn't exist; 1 -> on the same node; 0 -> on different node , which is my_node + 1
+    int is_previous_on_my_node;  // -1 -> doesn't exist; 1 -> on the same node; 0 -> on different node , which is my_node 
+
     int input_dim;
     int output_dim;
 
@@ -31,24 +36,32 @@ class Layer
 
     Matrix<float> x;
 
-    Layer(int input_dim, int output_dim)
+    Layer(int input_dim, int output_dim, int my_node, int prev, int next)
     {
         this->input_dim = input_dim;
         this->output_dim = output_dim;
 
-        w = Matrix<float>(output_dim, input_dim, 1, true);
-        dw = Matrix<float>(output_dim, input_dim, 1);
+        this->my_node = my_node;
+        this->is_next_on_my_node = next;
+        this->is_previous_on_my_node = prev;
+        
+        if(my_node == rank)
+        { // if this code is going to execute on my node, i must malloc otherwise what's the point of living
 
-        x = Matrix<float>(input_dim, 1, 1);
-        dx = Matrix<float>(input_dim, 1, 1);
+            w = Matrix<float>(output_dim, input_dim, 1, true);
+            dw = Matrix<float>(output_dim, input_dim, 1);
 
-        y = Matrix<float>(output_dim, 1, 1);
-        dy = Matrix<float>(output_dim, 1, 1);
+            x = Matrix<float>(input_dim, 1, 1);
+            dx = Matrix<float>(input_dim, 1, 1);
 
-        y_prime = Matrix<float>(output_dim, 1, 1);
+            y = Matrix<float>(output_dim, 1, 1);
+            dy = Matrix<float>(output_dim, 1, 1);
 
-        b = Matrix<float>(output_dim, 1, 1);
-        db = Matrix<float>(output_dim, 1, 1);
+            y_prime = Matrix<float>(output_dim, 1, 1);
+
+            b = Matrix<float>(output_dim, 1, 1);
+            db = Matrix<float>(output_dim, 1, 1);
+        }
     }
 
     ~Layer()
@@ -57,6 +70,11 @@ class Layer
 
     Matrix<float> forward(Matrix<float> x)
     {
+        if(this->is_previous_on_my_node == 0) 
+        {
+            // MPI_Recv(x,my_node-1)
+        }
+
         this->x = x;
 
         // this->x.print();
@@ -73,23 +91,52 @@ class Layer
         relu_forward<<<this->output_dim, 1>>>(this->y.get_d(), this->output_dim);
         cudaDeviceSynchronize();
 
+        if(this->is_next_on_my_node == 0) 
+        {
+            // MPI_Send(x, my_node+1)
+        }
+
         return y;
     }
 
     Matrix<float> backward_first(Matrix<float> input_gradient, Matrix<float> x)
     {
+
+        if(this->is_previous_on_my_node == 0) 
+        {
+            // MPI_Recv(x, my_node-1)
+            // MPI_Recv(input_gradient, my_node-1)
+        }
+
         relu_backward<<<this->output_dim,1>>>(input_gradient.get_d(), this->y_prime.get_d(), this->dy.get_d(), this->output_dim);
         matrix_mul_ty(&this->dy, &x, &this->dw);
         cudaDeviceSynchronize();
+
+        if(this->is_next_on_my_node == 0) 
+        {
+            // MPI_Send(dy, my_node+1)
+        }
+
 
         return dy;
     }
 
     Matrix<float> backward(Matrix<float> delta, int hidden_size, Matrix<float> input_gradient, Matrix<float> x)
     {
+        if(this->is_previous_on_my_node == 0) 
+        {
+            // MPI_Recv(x, my_node-1)
+            // MPI_Recv(delta, my_node-1)
+        }
+
         relu_backward<<<hidden_size,1>>>(input_gradient.get_d(), this->y_prime.get_d(), this->dy.get_d(), hidden_size);
         matrix_mul_ty(&this->dy, &x, &this->dw);
         cudaDeviceSynchronize();
+
+        if(this->is_next_on_my_node == 0) 
+        {
+            // MPI_Send(dy, my_node+1)
+        }
 
         return dy;
     }
@@ -134,58 +181,79 @@ class Network
     int input_dimension;
     int output_classes;
     int num_hidden;
-    int *hidden_sizes;
-    Network(int input_dimension, int output_classes, int num_hidden, int *hidden_sizes)
+    int *hidden_size;
+    int num_gpu;
+    Network(int input_dimension, int output_classes, int num_hidden, int *hidden_sizes, int num_gpu)
     {
+        this->num_gpu = num_gpu;
         this->input_dimension = input_dimension;
         this->output_classes = output_classes;
         this->num_hidden = num_hidden;
         this->hidden_sizes = hidden_sizes;
 
-        Layer *input_layer = new Layer(input_dimension, hidden_sizes[0]);
+
+        
+        Layer *input_layer = new Layer(input_dimension, hidden_sizes[0], 0, -1, 1);
         this->layers.insert(layers.end(), input_layer);
-        for (int i = 0; i < num_hidden - 1; i++)
-        {
-            Layer *hidden = new Layer(hidden_sizes[i], hidden_sizes[i + 1]);
-            this->layers.insert(layers.end(), hidden);
+        
+        int which_layer = 1;
+        for(int k = 0; k < num_gpu; k++){
+            for (int i = 0; i < num_gpu/hidden_sizes; i++)
+            {   
+                Layer *hidden;
+                hidden = new Layer(hidden_sizes[i], hidden_sizes[i + 1], k, <>, <>);                
+                this->layers.insert(layers.end(), hidden);
+            }
         }
-        Layer *output_layer = new Layer(hidden_sizes[num_hidden - 1], output_classes);
+        Layer *output_layer = new Layer(hidden_sizes[num_hidden - 1], output_classes, num_gpu, 1, -1);
         this->layers.insert(layers.end(), output_layer);
     }
 
     Matrix<float> forward(Matrix<float> x)
     {   
         Matrix<float> temp;
-        temp = Matrix<float>(this->input_dimension, 1, 1);
-        temp = x;
-        temp.to_gpu();
+        if(rank == 0){
+            temp = Matrix<float>(this->input_dimension, 1, 1);
+            temp = x;
+            temp.to_gpu();
+        }
         int i = 0;
         for (std::list<Layer *>::iterator it = this->layers.begin(); it != this->layers.end(); ++it)
         {
             Layer *exec = *it;
-            Matrix<float> temp2 = Matrix<float>(this->hidden_sizes[i],1,1);
-            temp2 = (*exec).forward(temp);
-            temp = Matrix<float>(this->hidden_sizes[i],1,1);
-            temp = temp2;
+
+            Matrix<float> temp;
+            if((*exec).my_node == rank){
+                temp = Matrix<float>(this->hidden_sizes[i],1,1);
+                temp2 = (*exec).forward(temp);
+                temp = Matrix<float>(this->hidden_sizes[i],1,1);
+                temp = temp2;
+            }
             i++;
         }
 
-        return temp;
+        return temp; // last node
     }
 
     void backward(Matrix<float> loss)
     {   
-        loss.to_gpu();
-        std::list<Layer *>::iterator end = this->layers.end();
-        end--;
-        Layer *exec = *end;
-        end--;
-        (*exec).backward_first(loss, (*end)->y);
-        (*end)->y.print();
+        std::list<Layer *>::iterator end;
+        Layer *exec;
+
+        if(rank == this->num_gpu) { 
+            loss.to_gpu();
+            end = this->layers.end();
+            end--;
+            exec = *end;
+            end--;
+            (*exec).backward_first(loss, (*end)->y);
+            (*end)->y.print();
+        }
+
         int i = this->num_hidden + 1;
         for (std::list<Layer *>::iterator it = this->layers.end(); it != this->layers.begin(); it--)
         {   
-
+            
             Layer *exec = *it;
             Matrix<float> temp2 = Matrix<float>(this->hidden_sizes[i],1,1);
             i--;
